@@ -441,7 +441,52 @@ type PatternsParams = {
   vendor?: string;
   competitorVendor?: string;
   threshold: number;
+  confidenceScope?: "all" | "high";
 };
+
+/**
+ * Helper function to check if a comparison is high confidence
+ * High confidence: exactMatch === true AND matchingScore >= 0.8
+ */
+function isHighConfidence(
+  exactMatch: boolean | null,
+  matchingScore: string | number | null,
+): boolean {
+  if (!exactMatch) return false;
+  const score = parseNumericValue(matchingScore) ?? 0;
+  return score >= 0.8;
+}
+
+/**
+ * Helper function to calculate median from an array of numbers
+ * Returns null if array is empty
+ */
+function calculateMedian(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return (sorted[mid - 1] + sorted[mid]) / 2;
+  }
+  return sorted[mid];
+}
+
+/**
+ * Helper function to categorize price index into severity buckets
+ */
+function categorizeSeverity(priceIndex: number, threshold: number): {
+  acceptable: boolean;
+  overpriced: boolean;
+  severelyOverpriced: boolean;
+} {
+  if (priceIndex <= threshold) {
+    return { acceptable: true, overpriced: false, severelyOverpriced: false };
+  }
+  if (priceIndex <= 1.3) {
+    return { acceptable: false, overpriced: true, severelyOverpriced: false };
+  }
+  return { acceptable: false, overpriced: false, severelyOverpriced: true };
+}
 
 export async function getPricingPatterns(params: PatternsParams) {
   const whereConditions = [];
@@ -454,8 +499,12 @@ export async function getPricingPatterns(params: PatternsParams) {
     );
   }
 
+  const confidenceScope = params.confidenceScope ?? "all";
+
+  // Query includes matchingScore and exactMatch for confidence filtering
   const queryBuilder = db
     .select({
+      productId: products.id,
       productVendor: products.vendor,
       competitorVendor: competitorProducts.competitorVendor,
       productUnitType: products.unitType,
@@ -468,6 +517,8 @@ export async function getPricingPatterns(params: PatternsParams) {
       competitorPrice: competitorProducts.price,
       normalizedOurPrice: normalizedPrices.ourUnitPrice,
       normalizedCompetitorPrice: normalizedPrices.competitorUnitPrice,
+      exactMatch: productMatches.exactMatch,
+      matchingScore: productMatches.matchingScore,
     })
     .from(productMatches)
     .innerJoin(products, eq(productMatches.productId, products.id))
@@ -487,16 +538,44 @@ export async function getPricingPatterns(params: PatternsParams) {
 
   const rows = await query;
 
+  // Vendor stats: comparison-weighted overpricing rate
   const vendorStats = new Map<
     string,
     { overpriced: number; total: number }
   >();
+
+  // Vendor product-level stats: unique products that are overpriced at least once
+  const vendorProductStats = new Map<
+    string,
+    { overpricedProductIds: Set<string>; totalProductIds: Set<string> }
+  >();
+
+  // Competitor stats: comparison-weighted cheaper rate
   const competitorStats = new Map<
     string,
     { cheaper: number; total: number }
   >();
 
+  // Competitor price index stats: for average and median calculation
+  const competitorPriceIndices = new Map<string, number[]>();
+
+  // Competitor severity buckets: counts per severity category
+  const competitorSeverityStats = new Map<
+    string,
+    { acceptable: number; overpriced: number; severelyOverpriced: number }
+  >();
+
   rows.forEach((row) => {
+    // Apply high-confidence filter if requested
+    // Parse matchingScore from database (numeric type returns as string)
+    const matchingScore = parseNumericValue(row.matchingScore);
+    if (
+      confidenceScope === "high" &&
+      !isHighConfidence(row.exactMatch, matchingScore)
+    ) {
+      return;
+    }
+
     const ourUnitPrice = resolveUnitPrice({
       normalized: row.normalizedOurPrice,
       rawPrice: row.productBasePrice,
@@ -513,11 +592,13 @@ export async function getPricingPatterns(params: PatternsParams) {
       unitUnit: row.competitorUnitUnit,
     });
 
+    // Only process rows with valid normalized unit prices
     if (ourUnitPrice === null || competitorUnitPrice === null) return;
 
     const priceIndex =
       competitorUnitPrice !== 0 ? ourUnitPrice / competitorUnitPrice : null;
 
+    // Vendor-level stats (comparison-weighted)
     const vendor = row.productVendor ?? "unknown";
     const vendorEntry = vendorStats.get(vendor) ?? { overpriced: 0, total: 0 };
     vendorEntry.total += 1;
@@ -526,6 +607,18 @@ export async function getPricingPatterns(params: PatternsParams) {
     }
     vendorStats.set(vendor, vendorEntry);
 
+    // Vendor product-level stats (deduplicated by product ID)
+    const vendorProductEntry = vendorProductStats.get(vendor) ?? {
+      overpricedProductIds: new Set<string>(),
+      totalProductIds: new Set<string>(),
+    };
+    vendorProductEntry.totalProductIds.add(row.productId);
+    if (priceIndex !== null && priceIndex > params.threshold) {
+      vendorProductEntry.overpricedProductIds.add(row.productId);
+    }
+    vendorProductStats.set(vendor, vendorProductEntry);
+
+    // Competitor stats (comparison-weighted)
     const competitor = row.competitorVendor ?? "unknown";
     const competitorEntry =
       competitorStats.get(competitor) ?? { cheaper: 0, total: 0 };
@@ -534,20 +627,73 @@ export async function getPricingPatterns(params: PatternsParams) {
       competitorEntry.cheaper += 1;
     }
     competitorStats.set(competitor, competitorEntry);
+
+    // Track price indices for average/median calculation
+    // Only include valid price indices where competitorUnitPrice > 0
+    if (priceIndex !== null && competitorUnitPrice > 0) {
+      const indices = competitorPriceIndices.get(competitor) ?? [];
+      indices.push(priceIndex);
+      competitorPriceIndices.set(competitor, indices);
+    }
+
+    // Track severity buckets for competitor
+    if (priceIndex !== null) {
+      const severity = categorizeSeverity(priceIndex, params.threshold);
+      const severityEntry = competitorSeverityStats.get(competitor) ?? {
+        acceptable: 0,
+        overpriced: 0,
+        severelyOverpriced: 0,
+      };
+      if (severity.acceptable) severityEntry.acceptable += 1;
+      if (severity.overpriced) severityEntry.overpriced += 1;
+      if (severity.severelyOverpriced) severityEntry.severelyOverpriced += 1;
+      competitorSeverityStats.set(competitor, severityEntry);
+    }
   });
 
-  const vendors = Array.from(vendorStats.entries()).map(([vendor, stats]) => ({
-    vendor,
-    overpricedRate: stats.total ? stats.overpriced / stats.total : 0,
-    totalProducts: stats.total,
-  }));
+  // Build vendors array with both comparison-weighted and product-level rates
+  const vendors = Array.from(vendorStats.entries()).map(([vendor, stats]) => {
+    const productStats = vendorProductStats.get(vendor) ?? {
+      overpricedProductIds: new Set<string>(),
+      totalProductIds: new Set<string>(),
+    };
+    const totalProducts = productStats.totalProductIds.size;
+    const overpricedProducts = productStats.overpricedProductIds.size;
+    const productOverpricedRate =
+      totalProducts > 0 ? overpricedProducts / totalProducts : 0;
 
+    return {
+      vendor,
+      overpricedRate: stats.total ? stats.overpriced / stats.total : 0,
+      productOverpricedRate,
+      totalProducts,
+    };
+  });
+
+  // Build competitors array with enhanced statistics
   const competitors = Array.from(competitorStats.entries()).map(
-    ([competitorVendor, stats]) => ({
-      competitorVendor,
-      cheaperRate: stats.total ? stats.cheaper / stats.total : 0,
-      totalComparisons: stats.total,
-    }),
+    ([competitorVendor, stats]) => {
+      const priceIndices = competitorPriceIndices.get(competitorVendor) ?? [];
+      const avgPriceIndex =
+        priceIndices.length > 0
+          ? priceIndices.reduce((sum, idx) => sum + idx, 0) / priceIndices.length
+          : null;
+      const medianPriceIndex = calculateMedian(priceIndices);
+      const severity = competitorSeverityStats.get(competitorVendor) ?? {
+        acceptable: 0,
+        overpriced: 0,
+        severelyOverpriced: 0,
+      };
+
+      return {
+        competitorVendor,
+        cheaperRate: stats.total ? stats.cheaper / stats.total : 0,
+        avgPriceIndex,
+        medianPriceIndex,
+        severity,
+        totalComparisons: stats.total,
+      };
+    },
   );
 
   return {
@@ -555,6 +701,7 @@ export async function getPricingPatterns(params: PatternsParams) {
     vendors,
     meta: {
       threshold: params.threshold,
+      confidenceScope,
     },
   };
 }

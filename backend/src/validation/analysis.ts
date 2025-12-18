@@ -14,10 +14,13 @@ const thresholdSchema = z.preprocess((value) => {
   return undefined;
 }, z.number().positive());
 
+const confidenceScopeSchema = z.enum(["all", "high"]).optional();
+
 const analysisBaseSchema = paginationSchema.extend({
   vendor: z.string().optional(),
   competitorVendor: z.string().optional(),
   threshold: thresholdSchema.optional(),
+  confidenceScope: confidenceScopeSchema,
 });
 
 export const overpricedQuerySchema = analysisBaseSchema;

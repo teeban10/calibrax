@@ -12,11 +12,13 @@ router.get("/", async (req, res, next) => {
     const threshold = parsed.threshold ?? DEFAULT_THRESHOLD;
     const vendor = parsed.vendor?.trim() || undefined;
     const competitorVendor = parsed.competitorVendor?.trim() || undefined;
+    const confidenceScope = parsed.confidenceScope || undefined;
 
     const result = await getPricingPatterns({
       threshold,
       vendor,
       competitorVendor,
+      confidenceScope,
     });
 
     res.json(result);
