@@ -214,6 +214,7 @@ pnpm start
 ### Data Ingestion
 - `POST /api/ingest/csv` - Ingest pricing data from CSV file
   - Body: `{ filePath: string }`
+  - Or in routes folder there is already a pricing_data.csv, just run the route to ingest
 
 ## Frontend Pages
 
