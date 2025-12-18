@@ -25,3 +25,6 @@ frontend/.env.production.local
 
 frontend/.pnpm-store/
 *.csv
+
+# Drizzle
+backend/drizzle/.meta

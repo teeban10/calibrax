@@ -1,0 +1,5 @@
+- There is no category, we must parse our own category
+- CSV given price index may not be trustable or reliable
+- What to build for later
+  - Category Parse
+  - Vendor Parse
